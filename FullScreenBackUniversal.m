@@ -27,6 +27,7 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 #include <math.h>
+#include <stdlib.h>
 
 // ============================== 1. 写死常量 =================================
 static const CGFloat kFSBDistance = 0.30f;    // 松手判定：拖过屏幕宽度 30% 才返回
@@ -170,7 +171,92 @@ static BOOL FSBNavBusy(UINavigationController *nav) {
     return NO;
 }
 
+// 前置声明（定义在下方第 6 节）
+static id FSBTransitionTarget(UINavigationController *nav);
+
 // ============================== 5. 手势代理 =================================
+// 转场互斥锁：一次转场进行中（含动画期）禁止再启动新手势，杜绝连续快速滑动重入卡死
+static BOOL gFSBInTransition = NO;
+// 上一次成功 pop 的时间戳：800ms 内再次滑动 → 回桌面
+static CFAbsoluteTime gFSBLastPopAt = 0;
+
+// 回桌面：优先私有 suspend（像按 Home 一样挂起回桌面，无崩溃痕迹），失败退 exit(0)
+static void FSBGoHome(void) {
+    @try {
+        UIApplication *app = [UIApplication sharedApplication];
+        SEL s = NSSelectorFromString([@[@"sus", @"pend"] componentsJoinedByString:@""]);
+        if (app && [app respondsToSelector:s]) {
+            ((void (*)(id, SEL))objc_msgSend)(app, s);
+            return;
+        }
+    } @catch (id e) {}
+    exit(0);
+}
+
+// 手势转发器：手势 target 用我们自己持有的对象，运行时才转发给系统转场驱动，
+// 加互斥锁与"连续两次回桌面"逻辑；避免直接以系统私有对象为 target 造成重入崩溃
+@interface FSBGestureForwarder : NSObject
++ (instancetype)shared;
+@end
+
+@implementation FSBGestureForwarder
++ (instancetype)shared {
+    static FSBGestureForwarder *s; static dispatch_once_t t;
+    dispatch_once(&t, ^{ s = [FSBGestureForwarder new]; });
+    return s;
+}
+
+- (void)fsbHandlePan:(UIPanGestureRecognizer *)pan {
+    @try {
+        UINavigationController *nav = FSBNavForView(pan.view);
+        if (!nav || nav.viewControllers.count < 2) return;
+
+        if (pan.state == UIGestureRecognizerStateBegan) {
+            if (gFSBInTransition) return;        // 互斥：转场中不启动新手势
+            if (FSBNavBusy(nav)) return;         // 系统转场协调器忙
+            gFSBInTransition = YES;
+            id target = FSBTransitionTarget(nav);
+            SEL handle = FSBHandleTransitionSEL();
+            if (target && [target respondsToSelector:handle]) {
+                ((void (*)(id, SEL, id))objc_msgSend)(target, handle, pan);
+            } else {
+                gFSBInTransition = NO;
+            }
+            return;
+        }
+        if (pan.state == UIGestureRecognizerStateChanged) {
+            id target = FSBTransitionTarget(nav);
+            SEL handle = FSBHandleTransitionSEL();
+            if (target && [target respondsToSelector:handle]) {
+                ((void (*)(id, SEL, id))objc_msgSend)(target, handle, pan);
+            }
+            return;
+        }
+        if (pan.state == UIGestureRecognizerStateEnded) {
+            CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+            BOOL secondSwipe = (now - gFSBLastPopAt) < 0.8;   // 800ms 内连续第二次
+            gFSBLastPopAt = now;
+            if (secondSwipe) {
+                gFSBInTransition = NO;
+                FSBGoHome();                                    // 连续两次 → 回桌面
+                return;
+            }
+            id target = FSBTransitionTarget(nav);
+            SEL handle = FSBHandleTransitionSEL();
+            if (target && [target respondsToSelector:handle]) {
+                ((void (*)(id, SEL, id))objc_msgSend)(target, handle, pan);
+            }
+            // 转场动画约 0.3s，延迟 0.5s 解锁覆盖整个动画期，防止快速重入
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{ gFSBInTransition = NO; });
+            return;
+        }
+        // Cancelled / Failed
+        gFSBInTransition = NO;
+    } @catch (id e) { gFSBInTransition = NO; }
+}
+@end
+
 @interface FSBGestureDelegate : NSObject <UIGestureRecognizerDelegate>
 + (instancetype)shared;
 @end
@@ -184,6 +270,7 @@ static BOOL FSBNavBusy(UINavigationController *nav) {
 
 - (BOOL)gestureRecognizerShouldBegin:(UIGestureRecognizer *)g {
     @try {
+        if (gFSBInTransition) return NO;               // 转场进行中：不开始新手势（防重入）
         if (![g isKindOfClass:[UIPanGestureRecognizer class]]) return NO;
         UIPanGestureRecognizer *pan = (UIPanGestureRecognizer *)g;
         UINavigationController *nav = FSBNavForView(g.view);
@@ -281,14 +368,6 @@ static id FSBTransitionTarget(UINavigationController *nav) {
 // ============================== 7. 安装 =====================================
 static void FSBInstallOnNav(UINavigationController *nav);
 
-static void FSBInstallRetry(UINavigationController *nav, NSInteger attempt) {
-    if (attempt > 12) return;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        FSBInstallOnNav(nav);
-    });
-}
-
 static void FSBInstallOnNav(UINavigationController *nav) {
     @try {
         if (!nav || ![nav isKindOfClass:[UINavigationController class]]) return;
@@ -303,17 +382,10 @@ static void FSBInstallOnNav(UINavigationController *nav) {
         // 顶层是媒体/图片查看器时不装（它们自己有横向手势）
         if (FSBIsExcludedTopVC(nav.topViewController)) return;
 
-        SEL handle = FSBHandleTransitionSEL();
-        id target = FSBTransitionTarget(nav);
-        if (!target || ![target respondsToSelector:handle]) {
-            // 系统还没就绪，稍后重试（最多 12 次）
-            FSBInstallRetry(nav, 0);
-            return;
-        }
-
-        // 直接以系统 transition 为 target：target 由系统持有，不会释放，
-        // 避免引入自定义代理类的额外符号依赖（上一版因此被 dyld 判缺符号闪退）
-        FSBFullScreenPan *pan = [[FSBFullScreenPan alloc] initWithTarget:target action:handle];
+        // target 用我们自己的转发器（转场驱动运行时才查找），
+        // 不再直接绑系统私有对象，重入防护与"连续两次回桌面"都在转发器里处理
+        FSBFullScreenPan *pan = [[FSBFullScreenPan alloc] initWithTarget:[FSBGestureForwarder shared]
+                                                                  action:@selector(fsbHandlePan:)];
         pan.delegate = [FSBGestureDelegate shared];
         pan.maximumNumberOfTouches = 1;
         pan.cancelsTouchesInView = NO;
