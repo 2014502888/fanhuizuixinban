@@ -12,9 +12,9 @@
 //    · 修复 x 版 FSBFallbackProxy 野指针：代理对象由 static 全局强持有，
 //      addTarget 的弱引用不会再指向已释放对象
 //    · 无 NSUserDefaults 配置项：行为全部写死（震动默认开）
-//  编译（zig 交叉编译，Windows 可用）：
-//      python build/build_ios_dylib.py plain/FullScreenBackUniversal.m build/out/FullScreenBackUniversal.dylib
-//  编译（clang / Xcode）：
+//    · 手势转发器：松手时走公开 API popViewControllerAnimated:，
+//      不转发系统私有交互式转场方法（私有转场在 Flutter/混合栈重入会卡死）
+//  编译（clang / Xcode，GitHub Actions 用）：
 //      xcrun -sdk iphoneos clang -arch arm64 -dynamiclib -O2 -fobjc-arc \
 //          -framework UIKit -framework Foundation \
 //          -Wno-undeclared-selector -mios-version-min=15.0 \
@@ -27,7 +27,6 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 #include <math.h>
-#include <stdlib.h>
 
 // ============================== 1. 写死常量 =================================
 static const CGFloat kFSBDistance = 0.30f;    // 松手判定：拖过屏幕宽度 30% 才返回
@@ -122,16 +121,6 @@ static UINavigationController *FSBNavForView(UIView *v) {
     return nil;
 }
 
-// 私有 selector 用字符串片段拼接，不在二进制里留完整明文
-static SEL FSBHandleTransitionSEL(void) {
-    static SEL sel; static dispatch_once_t t;
-    dispatch_once(&t, ^{
-        sel = NSSelectorFromString([@[@"handle", @"Navigation", @"Transition:"]
-                                    componentsJoinedByString:@""]);
-    });
-    return sel;
-}
-
 // 顶层控制器是否应被排除（它们自带横向手势/全屏浏览，会和我们抢手势）
 static BOOL FSBIsExcludedTopVC(UIViewController *vc) {
     if (!vc) return YES;
@@ -171,30 +160,10 @@ static BOOL FSBNavBusy(UINavigationController *nav) {
     return NO;
 }
 
-// 前置声明（定义在下方第 6 节）
-static id FSBTransitionTarget(UINavigationController *nav);
-
 // ============================== 5. 手势代理 =================================
-// 转场互斥锁：一次转场进行中（含动画期）禁止再启动新手势，杜绝连续快速滑动重入卡死
-static BOOL gFSBInTransition = NO;
-// 上一次成功 pop 的时间戳：800ms 内再次滑动 → 回桌面
-static CFAbsoluteTime gFSBLastPopAt = 0;
-
-// 回桌面：优先私有 suspend（像按 Home 一样挂起回桌面，无崩溃痕迹），失败退 exit(0)
-static void FSBGoHome(void) {
-    @try {
-        UIApplication *app = [UIApplication sharedApplication];
-        SEL s = NSSelectorFromString([@[@"sus", @"pend"] componentsJoinedByString:@""]);
-        if (app && [app respondsToSelector:s]) {
-            ((void (*)(id, SEL))objc_msgSend)(app, s);
-            return;
-        }
-    } @catch (id e) {}
-    exit(0);
-}
-
-// 手势转发器：手势 target 用我们自己持有的对象，运行时才转发给系统转场驱动，
-// 加互斥锁与"连续两次回桌面"逻辑；避免直接以系统私有对象为 target 造成重入崩溃
+// 手势转发器：手势 target 用我们自己持有的对象。
+// 只响应"松手"：直接调用公开 API popViewControllerAnimated:，
+// 不转发任何系统私有转场方法（私有转场在 Flutter/混合栈里重入会卡死）。
 @interface FSBGestureForwarder : NSObject
 + (instancetype)shared;
 @end
@@ -208,52 +177,12 @@ static void FSBGoHome(void) {
 
 - (void)fsbHandlePan:(UIPanGestureRecognizer *)pan {
     @try {
+        if (pan.state != UIGestureRecognizerStateEnded) return;   // 只处理松手
         UINavigationController *nav = FSBNavForView(pan.view);
         if (!nav || nav.viewControllers.count < 2) return;
-
-        if (pan.state == UIGestureRecognizerStateBegan) {
-            if (gFSBInTransition) return;        // 互斥：转场中不启动新手势
-            if (FSBNavBusy(nav)) return;         // 系统转场协调器忙
-            gFSBInTransition = YES;
-            id target = FSBTransitionTarget(nav);
-            SEL handle = FSBHandleTransitionSEL();
-            if (target && [target respondsToSelector:handle]) {
-                ((void (*)(id, SEL, id))objc_msgSend)(target, handle, pan);
-            } else {
-                gFSBInTransition = NO;
-            }
-            return;
-        }
-        if (pan.state == UIGestureRecognizerStateChanged) {
-            id target = FSBTransitionTarget(nav);
-            SEL handle = FSBHandleTransitionSEL();
-            if (target && [target respondsToSelector:handle]) {
-                ((void (*)(id, SEL, id))objc_msgSend)(target, handle, pan);
-            }
-            return;
-        }
-        if (pan.state == UIGestureRecognizerStateEnded) {
-            CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
-            BOOL secondSwipe = (now - gFSBLastPopAt) < 0.8;   // 800ms 内连续第二次
-            gFSBLastPopAt = now;
-            if (secondSwipe) {
-                gFSBInTransition = NO;
-                FSBGoHome();                                    // 连续两次 → 回桌面
-                return;
-            }
-            id target = FSBTransitionTarget(nav);
-            SEL handle = FSBHandleTransitionSEL();
-            if (target && [target respondsToSelector:handle]) {
-                ((void (*)(id, SEL, id))objc_msgSend)(target, handle, pan);
-            }
-            // 转场动画约 0.3s，延迟 0.5s 解锁覆盖整个动画期，防止快速重入
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{ gFSBInTransition = NO; });
-            return;
-        }
-        // Cancelled / Failed
-        gFSBInTransition = NO;
-    } @catch (id e) { gFSBInTransition = NO; }
+        if (FSBNavBusy(nav)) return;                               // 转场/模态中不触发
+        [nav popViewControllerAnimated:YES];                       // 公开 API，系统级防重入
+    } @catch (id e) {}
 }
 @end
 
@@ -270,7 +199,6 @@ static void FSBGoHome(void) {
 
 - (BOOL)gestureRecognizerShouldBegin:(UIGestureRecognizer *)g {
     @try {
-        if (gFSBInTransition) return NO;               // 转场进行中：不开始新手势（防重入）
         if (![g isKindOfClass:[UIPanGestureRecognizer class]]) return NO;
         UIPanGestureRecognizer *pan = (UIPanGestureRecognizer *)g;
         UINavigationController *nav = FSBNavForView(g.view);
@@ -311,60 +239,6 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)other 
 }
 @end
 
-// ============================== 6. 系统 target 解析 =========================
-// 三路径取系统交互式转场驱动器 _UINavigationInteractiveTransition
-static id FSBTransitionTarget(UINavigationController *nav) {
-    SEL handle = FSBHandleTransitionSEL();
-
-    // 路径 A：nav 的私有 _cachedInteractionController（WCPulse 实际用的）
-    @try {
-        SEL cached = NSSelectorFromString([@[@"_cached", @"Interaction", @"Controller"]
-                                           componentsJoinedByString:@""]);
-        if ([nav respondsToSelector:cached]) {
-            id ic = ((id (*)(id, SEL))objc_msgSend)(nav, cached);
-            if (ic && [ic respondsToSelector:handle]) return ic;
-        }
-    } @catch (id e) {}
-
-    // 路径 B：把系统交互式 pop 手势的 _targets[0]._target 抠出来
-    @try {
-        UIGestureRecognizer *sys = nav.interactivePopGestureRecognizer;
-        if (sys) {
-            id targets = [sys valueForKey:@"_targets"];
-            if ([targets isKindOfClass:[NSArray class]] && [targets count] > 0) {
-                id wrapper = [targets objectAtIndex:0];
-                if (wrapper) {
-                    id t = nil;
-                    @try { t = [wrapper valueForKey:@"_target"]; } @catch (id e) {}
-                    if (t && [t respondsToSelector:handle]) return t;
-                    if ([wrapper respondsToSelector:handle]) return wrapper;
-                }
-            }
-        }
-    } @catch (id e) {}
-
-    // 路径 C：在视图的手势里找 _UINavigationInteractiveTransition 实例
-    @try {
-        Class itc = NSClassFromString([@[@"_UINavigation", @"Interactive", @"Transition"]
-                                       componentsJoinedByString:@""]);
-        if (itc) {
-            for (UIGestureRecognizer *gr in nav.view.gestureRecognizers) {
-                id targets = nil;
-                @try { targets = [gr valueForKey:@"_targets"]; } @catch (id e) {}
-                if (![targets isKindOfClass:[NSArray class]]) continue;
-                for (id wrapper in targets) {
-                    id t = nil;
-                    @try { t = [wrapper valueForKey:@"_target"]; } @catch (id e) {}
-                    if (!t) t = wrapper;
-                    if ([t isKindOfClass:itc] && [t respondsToSelector:handle]) return t;
-                }
-            }
-        }
-    } @catch (id e) {}
-
-    return nil;
-}
-
 // ============================== 7. 安装 =====================================
 static void FSBInstallOnNav(UINavigationController *nav);
 
@@ -382,8 +256,8 @@ static void FSBInstallOnNav(UINavigationController *nav) {
         // 顶层是媒体/图片查看器时不装（它们自己有横向手势）
         if (FSBIsExcludedTopVC(nav.topViewController)) return;
 
-        // target 用我们自己的转发器（转场驱动运行时才查找），
-        // 不再直接绑系统私有对象，重入防护与"连续两次回桌面"都在转发器里处理
+        // target 用我们自己的转发器：松手时走公开 API popViewControllerAnimated:，
+        // 不转发任何系统私有转场方法（私有转场在 Flutter/混合栈里重入会卡死）
         FSBFullScreenPan *pan = [[FSBFullScreenPan alloc] initWithTarget:[FSBGestureForwarder shared]
                                                                   action:@selector(fsbHandlePan:)];
         pan.delegate = [FSBGestureDelegate shared];

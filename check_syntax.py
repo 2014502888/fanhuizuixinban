@@ -15,16 +15,20 @@ for a, b in [('{', '}'), ('(', ')'), ('[', ']')]:
         ok = False
 
 keys = [
-    'FSBGestureForwarder', 'fsbHandlePan:', 'FSBGoHome',
-    'gFSBInTransition', 'gFSBLastPopAt',
+    'FSBGestureForwarder',
+    'fsbHandlePan:',
+    'pan.state != UIGestureRecognizerStateEnded',
+    '[nav popViewControllerAnimated:YES]',
     'initWithTarget:[FSBGestureForwarder shared]',
-    '@catch (id e)', '#include <stdlib.h>',
-    'static id FSBTransitionTarget(UINavigationController *nav);',
-    'dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC))',
-    'SEL handle = FSBHandleTransitionSEL();',
+    '@catch (id e)',
 ]
 for kw in keys:
     print(('OK  ' if kw in src else 'MISS'), kw)
+
+# 已删除项必须不存在
+gone = ['FSBGoHome', 'gFSBInTransition', 'gFSBLastPopAt', 'FSBTransitionTarget', 'FSBHandleTransitionSEL', 'handleNavigationTransition', 'exit(']
+for kw in gone:
+    print(('CLEAN' if kw not in src else 'LEFTOVER!!'), kw)
 
 print('TOTAL:', 'PASS' if ok else 'FAIL')
 sys.exit(0 if ok else 1)
