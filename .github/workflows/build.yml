@@ -1,0 +1,26 @@
+﻿name: build
+on: [push]
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build dylib (Xcode clang, arm64)
+        run: |
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          echo "SDK=$SDK"
+          clang -arch arm64 -isysroot "$SDK" -dynamiclib -O2 -fobjc-arc -fobjc-exceptions \
+                -framework UIKit -framework Foundation -framework CoreFoundation \
+                -Wno-undeclared-selector -Wno-deprecated-declarations \
+                -mios-version-min=15.0 \
+                -o FullScreenBackUniversal.dylib FullScreenBackUniversal.m \
+                -install_name @rpath/FullScreenBackUniversal.dylib
+          ls -l FullScreenBackUniversal.dylib
+          file FullScreenBackUniversal.dylib
+      - name: Upload dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: FullScreenBackUniversal
+          path: |
+            FullScreenBackUniversal.dylib
+            FullScreenBackUniversal.plist
