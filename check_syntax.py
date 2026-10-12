@@ -15,18 +15,20 @@ for a, b in [('{', '}'), ('(', ')'), ('[', ']')]:
         ok = False
 
 keys = [
-    'FSBGestureForwarder',
-    'fsbHandlePan:',
-    'pan.state != UIGestureRecognizerStateEnded',
-    '[nav popViewControllerAnimated:YES]',
-    'initWithTarget:[FSBGestureForwarder shared]',
-    '@catch (id e)',
+    'FSBGestureForwarder', 'fsbHandlePan:', '[nav popViewControllerAnimated:YES]',
+    'initWithTarget:[FSBGestureForwarder shared]', '@catch (id e)',
+    'SW_NAV_PUSH', 'SW_NAV_SETVCS', 'gSwizzle[4]', 'depth > 64',
 ]
 for kw in keys:
     print(('OK  ' if kw in src else 'MISS'), kw)
 
-# 已删除项必须不存在
-gone = ['FSBGoHome', 'gFSBInTransition', 'gFSBLastPopAt', 'FSBTransitionTarget', 'FSBHandleTransitionSEL', 'handleNavigationTransition', 'exit(']
+gone = [
+    'FSBGoHome', 'gFSBInTransition', 'gFSBLastPopAt', 'FSBTransitionTarget',
+    'FSBHandleTransitionSEL', 'exit(', 'SW_NAV_VIEWDIDLOAD', 'SW_NAV_VIEWDIDAPPEAR',
+    'SW_VC_VIEWDIDAPPEAR', 'FSB_UINavigationController_viewDidLoad',
+    'FSB_UINavigationController_viewDidAppear', 'FSB_UIViewController_viewDidAppear',
+    'handleNavigationTransition',
+]
 for kw in gone:
     print(('CLEAN' if kw not in src else 'LEFTOVER!!'), kw)
 

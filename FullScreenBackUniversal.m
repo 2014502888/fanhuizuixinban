@@ -272,9 +272,12 @@ static void FSBInstallOnNav(UINavigationController *nav) {
     } @catch (id e) {}
 }
 
-// 递归遍历：nav / tab / split / child / presented
+// 递归遍历：nav / tab / split / child / presented（带深度上限，防异常深层树拖死主线程）
 static void FSBWalk(UIViewController *vc) {
     if (!vc) return;
+    static int depth = 0;
+    if (depth > 64) return;
+    depth++;
     @try {
         if ([vc isKindOfClass:[UINavigationController class]]) {
             FSBInstallOnNav((UINavigationController *)vc);
@@ -289,6 +292,7 @@ static void FSBWalk(UIViewController *vc) {
         for (UIViewController *c in vc.childViewControllers) FSBWalk(c);
         if (vc.presentedViewController) FSBWalk(vc.presentedViewController);
     } @catch (id e) {}
+    depth--;
 }
 
 static void FSBInstallAll(void) {
@@ -307,14 +311,17 @@ static void FSBInstallAll(void) {
 }
 
 // ============================== 9. Hook =====================================
+// 只 swizzle 两个栈变化方法（push / setViewControllers）。
+// 注意：不再 swizzle UIViewController.viewDidAppear: 和 nav 的 viewDidLoad/viewDidAppear:
+// —— 这两个在 Flutter 类应用里会被引擎高频触发，主线程叠加手势安装会拖死界面（实测卡死）。
 typedef struct { Class cls; SEL sel; IMP orig; } FSBSwizzle;
 
-static FSBSwizzle gSwizzle[8];
+static FSBSwizzle gSwizzle[4];
 static int gSwizzleCount = 0;
 
 static void FSBSwizzleMethod(Class cls, SEL sel, IMP newImp) {
     @try {
-        if (!cls || !sel || !newImp || gSwizzleCount >= 8) return;
+        if (!cls || !sel || !newImp || gSwizzleCount >= 4) return;
         FSBSwizzle *slot = &gSwizzle[gSwizzleCount++];
         slot->cls = cls;
         slot->sel = sel;
@@ -331,26 +338,9 @@ static void FSBSwizzleMethod(Class cls, SEL sel, IMP newImp) {
 }
 
 // 槽位索引（必须与 FSBEntry 中的注册顺序一致）
-#define SW_NAV_VIEWDIDLOAD   0
-#define SW_NAV_VIEWDIDAPPEAR 1
-#define SW_NAV_PUSH          2
-#define SW_NAV_SETVCS        3
-#define SW_VC_VIEWDIDAPPEAR  4
+#define SW_NAV_PUSH   0
+#define SW_NAV_SETVCS 1
 
-static void FSB_UINavigationController_viewDidLoad(id self, SEL _cmd) {
-    @try {
-        IMP o = gSwizzle[SW_NAV_VIEWDIDLOAD].orig;
-        if (o) ((void (*)(id, SEL))o)(self, _cmd);
-    } @catch (id e) {}
-    FSBInstallOnNav(self);
-}
-static void FSB_UINavigationController_viewDidAppear(id self, SEL _cmd, BOOL animated) {
-    @try {
-        IMP o = gSwizzle[SW_NAV_VIEWDIDAPPEAR].orig;
-        if (o) ((void (*)(id, SEL, BOOL))o)(self, _cmd, animated);
-    } @catch (id e) {}
-    if (((UINavigationController *)self).viewControllers.count >= 2) FSBInstallOnNav(self);
-}
 static void FSB_UINavigationController_pushViewController(id self, SEL _cmd, UIViewController *vc, BOOL animated) {
     @try {
         IMP o = gSwizzle[SW_NAV_PUSH].orig;
@@ -366,34 +356,17 @@ static void FSB_UINavigationController_setViewControllers(id self, SEL _cmd, NSA
     } @catch (id e) {}
     dispatch_async(dispatch_get_main_queue(), ^{ FSBInstallOnNav(self); });
 }
-static void FSB_UIViewController_viewDidAppear(id self, SEL _cmd, BOOL animated) {
-    @try {
-        IMP o = gSwizzle[SW_VC_VIEWDIDAPPEAR].orig;
-        if (o) ((void (*)(id, SEL, BOOL))o)(self, _cmd, animated);
-    } @catch (id e) {}
-    @try {
-        UINavigationController *nav = ((UIViewController *)self).navigationController;
-        if (nav) FSBInstallOnNav(nav);
-    } @catch (id e) {}
-}
 
 // ============================== 10. 入口 ====================================
 __attribute__((constructor)) static void FSBEntry(void) {
     @autoreleasepool {
         @try {
             Class navCls = objc_getClass("UINavigationController");
-            Class vcCls  = objc_getClass("UIViewController");
             gSwizzleCount = 0;
-            FSBSwizzleMethod(navCls, sel_registerName("viewDidLoad"),
-                             (IMP)FSB_UINavigationController_viewDidLoad);
-            FSBSwizzleMethod(navCls, sel_registerName("viewDidAppear:"),
-                             (IMP)FSB_UINavigationController_viewDidAppear);
             FSBSwizzleMethod(navCls, sel_registerName("pushViewController:animated:"),
                              (IMP)FSB_UINavigationController_pushViewController);
             FSBSwizzleMethod(navCls, sel_registerName("setViewControllers:animated:"),
                              (IMP)FSB_UINavigationController_setViewControllers);
-            FSBSwizzleMethod(vcCls, sel_registerName("viewDidAppear:"),
-                             (IMP)FSB_UIViewController_viewDidAppear);
 
             // 延迟全量安装（等启动完成后 controller 树就绪）
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
